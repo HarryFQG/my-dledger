@@ -23,6 +23,11 @@ public abstract class DLedgerStore {
 
     public abstract MemberState getMemberState();
 
+    /**
+     * DLedgerStore有两个实现类，分别为DLedgerMemoryStore（基于内存存储）和DLedgerMmapFileStore（基于Mmap文件映射）
+     * @param entry
+     * @return
+     */
     public abstract DLedgerEntry appendAsLeader(DLedgerEntry entry);
 
     public abstract DLedgerEntry appendAsFollower(DLedgerEntry entry, long leaderTerm, String leaderId);
@@ -39,6 +44,7 @@ public abstract class DLedgerStore {
 
     protected void updateLedgerEndIndexAndTerm() {
         if (getMemberState() != null) {
+            // 调用MemberState的updateLedgerIndexAndTerm进行更新
             getMemberState().updateLedgerIndexAndTerm(getLedgerEndIndex(), getLedgerEndTerm());
         }
     }

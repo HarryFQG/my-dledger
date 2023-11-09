@@ -54,7 +54,13 @@ public class DLedgerMmapFileStore extends DLedgerStore {
     private final MemberState memberState;
     private final MmapFileList dataFileList;
     private final MmapFileList indexFileList;
+    /**
+     * 日志数据buffer
+     */
     private final ThreadLocal<ByteBuffer> localEntryBuffer;
+    /**
+     * 索引数据buffer
+     */
     private final ThreadLocal<ByteBuffer> localIndexBuffer;
     private final FlushDataService flushDataService;
     private final CleanSpaceService cleanSpaceService;
@@ -342,20 +348,47 @@ public class DLedgerMmapFileStore extends DLedgerStore {
 
     }
 
+    /**
+     * 1. appendAsLeader的处理逻辑：
+     *      1. 进行Leader节点校验和磁盘已满校验；
+     *      2. 获取日志数据buffer（dataBuffer）和索引数据buffer（indexBuffer），会先将内容写入buffer，再将buffer内容写入文件；
+     *      3. 将entry消息内容写入dataBuffer；
+     *      4. 设置消息的index（为每条消息进行了编号），为ledgerEndIndex + 1，ledgerEndIndex初始值为-1，新增一条消息ledgerEndIndex的值也会增1
+     *          ，ledgerEndIndex是随着消息的增加而递增的，写入成功之后会更新ledgerEndIndex的值，ledgerEndIndex记录最后一条成功写入消息的index;
+     *      5. 调用dataFileList的append方法将dataBuffer内容写入日志文件，返回数据在文件中的偏移量；
+     *      6. 将索引信息写入indexBuffer；
+     *      7. 调用indexFileList的append方法将indexBuffer内容写入索引文件；
+     *      8. ledgerEndIndex加1；
+     *      9. 设置ledgerEndTerm的值为当前Term；
+     *      10. 调用updateLedgerEndIndexAndTerm方法更新MemberState中记录的LedgerEndIndex和LedgerEndTerm的值，LedgerEndIndex会在FLUSH的时候
+     *      ，将内容写入到文件进行持久化保存。
+     *
+     * @param entry
+     * @return
+     */
     @Override
     public DLedgerEntry appendAsLeader(DLedgerEntry entry) {
+        // Leader校验判断当前节点是否是Leader
         PreConditions.check(memberState.isLeader(), DLedgerResponseCode.NOT_LEADER);
+        // 磁盘是否已满校验
         PreConditions.check(!isDiskFull, DLedgerResponseCode.DISK_FULL);
+        // 获取日志数据buffer
         ByteBuffer dataBuffer = localEntryBuffer.get();
+        // 获取索引数据buffer
         ByteBuffer indexBuffer = localIndexBuffer.get();
+        // 将entry消息内容写入dataBuffer
         DLedgerEntryCoder.encode(entry, dataBuffer);
         int entrySize = dataBuffer.remaining();
         synchronized (memberState) {
             PreConditions.check(memberState.isLeader(), DLedgerResponseCode.NOT_LEADER, null);
             PreConditions.check(memberState.getTransferee() == null, DLedgerResponseCode.LEADER_TRANSFERRING, null);
+            // 设置消息的index，为ledgerEndIndex + 1
             long nextIndex = ledgerEndIndex + 1;
+            // 设置消息的index
             entry.setIndex(nextIndex);
+            // 设置Term
             entry.setTerm(memberState.currTerm());
+            // 设置Term的Index
             DLedgerEntryCoder.setIndexTerm(dataBuffer, nextIndex, memberState.currTerm(), entry.getMagic());
             long prePos = dataFileList.preAppend(dataBuffer.remaining());
             entry.setPos(prePos);
@@ -364,17 +397,23 @@ public class DLedgerMmapFileStore extends DLedgerStore {
             for (AppendHook writeHook : appendHooks) {
                 writeHook.doHook(entry, dataBuffer.slice(), DLedgerEntry.BODY_OFFSET);
             }
+            // 将dataBuffer内容写入日志文件，返回数据的位置
             long dataPos = dataFileList.append(dataBuffer.array(), 0, dataBuffer.remaining());
             PreConditions.check(dataPos != -1, DLedgerResponseCode.DISK_ERROR, null);
             PreConditions.check(dataPos == prePos, DLedgerResponseCode.DISK_ERROR, null);
+            // 将索引信息写入indexBuffer
             DLedgerEntryCoder.encodeIndex(dataPos, entrySize, DLedgerEntryType.NORMAL.getMagic(), nextIndex, memberState.currTerm(), indexBuffer);
+            //  将indexBuffer内容写入索引文件
             long indexPos = indexFileList.append(indexBuffer.array(), 0, indexBuffer.remaining(), false);
             PreConditions.check(indexPos == entry.getIndex() * INDEX_UNIT_SIZE, DLedgerResponseCode.DISK_ERROR, null);
             if (LOGGER.isDebugEnabled()) {
                 LOGGER.info("[{}] Append as Leader {} {}", memberState.getSelfId(), entry.getIndex(), entry.getBody().length);
             }
+            // ledgerEndIndex自增
             ledgerEndIndex++;
+            // 设置ledgerEndTerm的值为当前Term
             ledgerEndTerm = memberState.currTerm();
+            // 更新LedgerEndIndex和LedgerEndTerm
             updateLedgerEndIndexAndTerm();
             return entry;
         }
@@ -571,11 +610,22 @@ public class DLedgerMmapFileStore extends DLedgerStore {
         this.ledgerEndTerm = lastIncludedTerm;
     }
 
+    /**
+     * 写入文件
+     * 同样以DLedgerMmapFileStore为例，看下appendAsFollower方法的处理过程，前面已经讲过appendAsLeader的处理逻辑，他们的处理过程相似，基本就是将entry内容写入buffer
+     * ，然后再将buffer写入数据文件和索引文件，这里不再赘述：
+     * @param entry
+     * @param leaderTerm
+     * @param leaderId
+     * @return
+     */
     @Override
     public DLedgerEntry appendAsFollower(DLedgerEntry entry, long leaderTerm, String leaderId) {
         PreConditions.check(memberState.isFollower(), DLedgerResponseCode.NOT_FOLLOWER, "role=%s", memberState.getRole());
         PreConditions.check(!isDiskFull, DLedgerResponseCode.DISK_FULL);
+        // 获取数据Buffer
         ByteBuffer dataBuffer = localEntryBuffer.get();
+        // 获取索引Buffer
         ByteBuffer indexBuffer = localIndexBuffer.get();
         DLedgerEntryCoder.encode(entry, dataBuffer);
         int entrySize = dataBuffer.remaining();
@@ -585,8 +635,10 @@ public class DLedgerMmapFileStore extends DLedgerStore {
             PreConditions.check(nextIndex == entry.getIndex(), DLedgerResponseCode.INCONSISTENT_INDEX, null);
             PreConditions.check(leaderTerm == memberState.currTerm(), DLedgerResponseCode.INCONSISTENT_TERM, null);
             PreConditions.check(leaderId.equals(memberState.getLeaderId()), DLedgerResponseCode.INCONSISTENT_LEADER, null);
+            // 写入数据文件
             long dataPos = dataFileList.append(dataBuffer.array(), 0, dataBuffer.remaining());
             DLedgerEntryCoder.encodeIndex(dataPos, entrySize, entry.getMagic(), entry.getIndex(), entry.getTerm(), indexBuffer);
+            // 写入索引文件
             long indexPos = indexFileList.append(indexBuffer.array(), 0, indexBuffer.remaining(), false);
             PreConditions.check(indexPos == entry.getIndex() * INDEX_UNIT_SIZE, DLedgerResponseCode.DISK_ERROR, null);
             ledgerEndTerm = entry.getTerm();

@@ -256,6 +256,11 @@ public class MemberState {
         return defaultLock;
     }
 
+    /**
+     *  更新ledgerEndIndex和ledgerEndTerm
+     * @param index
+     * @param term
+     */
     public void updateLedgerIndexAndTerm(long index, long term) {
         this.ledgerEndIndex = index;
         this.ledgerEndTerm = term;

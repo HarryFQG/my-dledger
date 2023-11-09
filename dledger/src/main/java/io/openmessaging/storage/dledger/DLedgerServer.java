@@ -131,6 +131,7 @@ public class DLedgerServer extends AbstractDLedgerServer {
         dLedgerConfig.init();
         this.dLedgerConfig = dLedgerConfig;
         this.memberState = new MemberState(dLedgerConfig);
+        // 根据配置中的StoreType创建DLedgerStore
         this.dLedgerStore = createDLedgerStore(dLedgerConfig.getStoreType(), this.dLedgerConfig, this.memberState);
         this.dLedgerRpcService = new DLedgerRpcNettyService(this, nettyServerConfig, nettyClientConfig, channelEventListener);
         this.rpcServiceMode = RpcServiceMode.EXCLUSIVE;
@@ -218,6 +219,13 @@ public class DLedgerServer extends AbstractDLedgerServer {
         }
     }
 
+    /**
+     *  创建DLedgerStore
+     * @param storeType
+     * @param config
+     * @param memberState
+     * @return
+     */
     private DLedgerStore createDLedgerStore(String storeType, DLedgerConfig config, MemberState memberState) {
         if (storeType.equals(DLedgerConfig.MEMORY)) {
             return new DLedgerMemoryStore(config, memberState);
@@ -290,31 +298,44 @@ public class DLedgerServer extends AbstractDLedgerServer {
 
     /**
      * Handle the append requests: 1.append the entry to local store 2.submit the future to entry pusher and wait the
-     * quorum ack 3.if the pending requests are full, then reject it immediately
+     * quorum ack 3.if the pending requests are full, then reject it immediately (处理追加请求:将条目追加到本地存储2。将未来提交给条目推动者并等待quorum ack 3。如果挂起的请求已满，则立即拒绝它)
+     *
+     * 1. 将消息数据序列化之后，封装了消息追加请求，调用handleAppend方法写入消息，处理逻辑如下：
+     *      1. 获取当前的Term，判断当前Term对应的写入请求数量是否超过了最大值，如果未超过进入下一步，如果超过，设置响应状态为LEADER_PENDING_FULL表示处理的消息追加请求数量过多，拒绝处理当前请求；
+     *      2. 校验是否是批量请求：
+     *          1. 如果是：遍历每一个消息，为消息创建DLedgerEntry对象，调用appendAsLeader将消息写入到Leader节点， 并调用waitAck为最后最后一条消息创建异步响应对象；
+     *          2. 如果不是：直接为消息创建DLedgerEntry对象，调用appendAsLeader将消息写入到Leader节点并调用waitAck创建异步响应对象；
      */
     @Override
     public CompletableFuture<AppendEntryResponse> handleAppend(AppendEntryRequest request) throws IOException {
         try {
             PreConditions.check(memberState.getSelfId().equals(request.getRemoteId()), DLedgerResponseCode.UNKNOWN_MEMBER, "%s != %s", request.getRemoteId(), memberState.getSelfId());
             PreConditions.check(memberState.getGroup().equals(request.getGroup()), DLedgerResponseCode.UNKNOWN_GROUP, "%s != %s", request.getGroup(), memberState.getGroup());
+            // 校验是否是Leader节点，如果不是Leader抛出NOT_LEADER异常
             PreConditions.check(memberState.isLeader(), DLedgerResponseCode.NOT_LEADER);
             PreConditions.check(memberState.getTransferee() == null, DLedgerResponseCode.LEADER_TRANSFERRING);
+            // 获取当前的Term
             long currTerm = memberState.currTerm();
+            // 判断Pengding请求的数量
             if (dLedgerEntryPusher.isPendingFull(currTerm)) {
                 AppendEntryResponse appendEntryResponse = new AppendEntryResponse();
                 appendEntryResponse.setGroup(memberState.getGroup());
+                // 设置响应结果LEADER_PENDING_FULL
                 appendEntryResponse.setCode(DLedgerResponseCode.LEADER_PENDING_FULL.getCode());
+                // 设置Term
                 appendEntryResponse.setTerm(currTerm);
+                // 设置LeaderID
                 appendEntryResponse.setLeaderId(memberState.getSelfId());
                 return AppendFuture.newCompletedFuture(-1, appendEntryResponse);
             }
             AppendFuture<AppendEntryResponse> future;
-            if (request instanceof BatchAppendEntryRequest) {
+            if (request instanceof BatchAppendEntryRequest) { // 批量数据
                 BatchAppendEntryRequest batchRequest = (BatchAppendEntryRequest) request;
                 if (batchRequest.getBatchMsgs() == null || batchRequest.getBatchMsgs().isEmpty()) {
                     throw new DLedgerException(DLedgerResponseCode.REQUEST_WITH_EMPTY_BODYS, "BatchAppendEntryRequest" +
                         " with empty bodys");
                 }
+                // 遍历每一个消息
                 future = appendAsLeader(batchRequest.getBatchMsgs());
             } else {
                 future = appendAsLeader(request.getBody());
@@ -345,20 +366,29 @@ public class DLedgerServer extends AbstractDLedgerServer {
         long totalBytes = 0;
         if (bodies.size() > 1) {
             long[] positions = new long[bodies.size()];
+            // 遍历每一个消息
             for (int i = 0; i < bodies.size(); i++) {
                 totalBytes += bodies.get(i).length;
+                // 创建DLedgerEntry
                 DLedgerEntry dLedgerEntry = new DLedgerEntry();
+                // 设置消息内容
                 dLedgerEntry.setBody(bodies.get(i));
+                // 写入消息
                 entry = dLedgerStore.appendAsLeader(dLedgerEntry);
                 positions[i] = entry.getPos();
             }
             // only wait last entry ack is ok
+            // 为最后一个dLedgerEntry创建异步响应对象
             future = new BatchAppendFuture<>(positions);
         } else {
+            // 普通消息
             DLedgerEntry dLedgerEntry = new DLedgerEntry();
             totalBytes += bodies.get(0).length;
+            // 设置消息内容
             dLedgerEntry.setBody(bodies.get(0));
+            // 写入消息
             entry = dLedgerStore.appendAsLeader(dLedgerEntry);
+            // 等待响应，创建异步响应对象
             future = new AppendFuture<>();
         }
         final DLedgerEntry finalResEntry = entry;
@@ -386,6 +416,7 @@ public class DLedgerServer extends AbstractDLedgerServer {
                 finalFuture.complete(response);
             }
         };
+        // 这里往 io.openmessaging.storage.dledger.DLedgerEntryPusher.pendingClosure 塞值的。
         dLedgerEntryPusher.appendClosure(closure, finalResEntry.getTerm(), finalResEntry.getIndex());
         return finalFuture;
     }
